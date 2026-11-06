@@ -1,0 +1,255 @@
+diff --git a/src/Features/Downloads/FBPReelsDownloader.xm b/src/Features/Downloads/FBPReelsDownloader.xm
+index 1ca935e..f04cf89 100644
+--- a/src/Features/Downloads/FBPReelsDownloader.xm
++++ b/src/Features/Downloads/FBPReelsDownloader.xm
+@@ -44,6 +44,10 @@ static BOOL gSidebarHookInstalled = NO;
+ static BOOL gLifecycleHooksInstalled = NO;
+ static BOOL gHitTestHookInstalled = NO;
+ 
++// 3-finger-hold download: YES only while a Reel is on screen (set by the tracker).
++static BOOL gReelOnScreen = NO;
++static const void *kFBPHoldGestureKey = &kFBPHoldGestureKey;
++
+ static __weak id gMediaOwnerPlayerVC = nil;
+ 
+ static const NSInteger kFBPDownloadButtonTag =
+@@ -1114,8 +1118,8 @@ static id FBPObjectIvar(id object, const char *name) {
+     return nil;
+ }
+ 
+-static BOOL FBPCaptureActivePlaybackController(UIButton *sender) {
+-    UIWindow *window = sender.window;
++static BOOL FBPCaptureActivePlaybackController(UIView *sender) {
++    UIWindow *window = sender.window ?: ([sender isKindOfClass:UIWindow.class] ? (UIWindow *)sender : nil);
+     if (!window) return NO;
+ 
+     Class playerClass =
+@@ -1172,7 +1176,7 @@ static BOOL FBPCaptureActivePlaybackController(UIButton *sender) {
+ #pragma mark - Button handler
+ 
+ @interface FBPReelDownloadHandler :
+-    NSObject
++    NSObject <UIGestureRecognizerDelegate>
+ 
+ + (instancetype)shared;
+ 
+@@ -1188,6 +1192,9 @@ static BOOL FBPCaptureActivePlaybackController(UIButton *sender) {
+ - (void)hideOverlayButtonPressed:
+     (UIButton *)sender;
+ 
++- (void)threeFingerHold:
++    (UILongPressGestureRecognizer *)gesture;
++
+ @end
+ 
+ // Forward declaration — defined with the window-button helpers below.
+@@ -1267,6 +1274,30 @@ static void FBPUpdateHideOverlayButtonIcon(UIButton *button);
+         videoID:videoID];
+ }
+ 
++- (void)threeFingerHold:
++    (UILongPressGestureRecognizer *)gesture {
++
++    if (gesture.state != UIGestureRecognizerStateBegan) return;
++    if (!gReelOnScreen) return;
++    if (![FBPPrefs.shared boolForKey:FBPKeyReelsDownloaderEnabled]) return;
++
++    UIImpactFeedbackGenerator *haptic =
++        [[UIImpactFeedbackGenerator alloc]
++            initWithStyle:UIImpactFeedbackStyleMedium];
++    [haptic impactOccurred];
++
++    [self downloadButtonPressed:(UIButton *)gesture.view];
++}
++
++- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
++    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
++    return YES;
++}
++
++- (BOOL)gestureRecognizerShouldBegin:(UIGestureRecognizer *)g {
++    return gReelOnScreen;
++}
++
+ - (void)hideOverlayButtonPressed:
+     (UIButton *)sender {
+ 
+@@ -1661,6 +1692,28 @@ FBPGetOrCreateHideOverlayButton(
+     return button;
+ }
+ 
++#pragma mark - 3-finger hold gesture
++
++static void FBPInstallHoldGesture(UIWindow *window) {
++    if (!window) return;
++    if (objc_getAssociatedObject(window, kFBPHoldGestureKey)) return;
++
++    FBPReelDownloadHandler *handler = [FBPReelDownloadHandler shared];
++    UILongPressGestureRecognizer *g =
++        [[UILongPressGestureRecognizer alloc]
++            initWithTarget:handler
++                    action:@selector(threeFingerHold:)];
++    g.numberOfTouchesRequired = 3;
++    g.minimumPressDuration = 0.6;
++    g.cancelsTouchesInView = NO;
++    g.delaysTouchesBegan = NO;
++    g.delaysTouchesEnded = NO;
++    g.delegate = handler;
++    [window addGestureRecognizer:g];
++    objc_setAssociatedObject(window, kFBPHoldGestureKey, g,
++                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
++}
++
+ #pragma mark - Display-link tracker
+ 
+ @interface FBPReelButtonTracker : NSObject
+@@ -1828,19 +1881,22 @@ static BOOL FBPPlusSettingsIsPresented(UIWindow *window) {
+ }
+ 
+ - (void)tick:(__unused CADisplayLink *)link {
+-    if (!gSidebars || gSidebars.count == 0) return;
++    if (!gSidebars || gSidebars.count == 0) { gReelOnScreen = NO; return; }
+ 
+     UIWindow *window = nil;
+     for (UIView *sidebar in gSidebars.allObjects) {
+         if (sidebar.window) { window = sidebar.window; break; }
+     }
+-    if (!window) return;
++    if (!window) { gReelOnScreen = NO; return; }
+ 
+     BOOL downloaderEnabled =
+         [FBPPrefs.shared boolForKey:FBPKeyReelsDownloaderEnabled];
+     BOOL hideEnabled =
+         [FBPPrefs.shared boolForKey:FBPKeyReelsHideOverlay];
+ 
++    if (downloaderEnabled) FBPInstallHoldGesture(window);
++    gReelOnScreen = NO;
++
+     UIButton *downloadButton =
+         (UIButton *)[window viewWithTag:kFBPDownloadButtonTag];
+     UIButton *toggleButton =
+@@ -1921,6 +1977,8 @@ static BOOL FBPPlusSettingsIsPresented(UIWindow *window) {
+         return;
+     }
+ 
++    gReelOnScreen = downloaderEnabled;
++
+     // On a Reel: fade the tab bar in lock-step with cinema mode, restore it when
+     // cinema mode is off.
+     if (gOverlayHidden && hideEnabled) {
+@@ -1932,10 +1990,9 @@ static BOOL FBPPlusSettingsIsPresented(UIWindow *window) {
+ 
+     // Create only the buttons whose feature is enabled; take down any button
+     // whose feature was turned off in settings.
+-    UIButton *download =
+-        downloaderEnabled ? FBPGetOrCreateWindowButton(window) : nil;
+-    UIButton *toggle =
+-        hideEnabled ? FBPGetOrCreateHideOverlayButton(window) : nil;
++    // Download is now a 3-finger hold, and the eye toggle is removed.
++    UIButton *download = nil;
++    UIButton *toggle = nil;
+ 
+     if (!downloaderEnabled && downloadButton)
+         [self setButton:downloadButton visible:NO];
+diff --git a/src/Features/Downloads/FBPStoryDownloader.xm b/src/Features/Downloads/FBPStoryDownloader.xm
+index 5b21eb9..477f41e 100644
+--- a/src/Features/Downloads/FBPStoryDownloader.xm
++++ b/src/Features/Downloads/FBPStoryDownloader.xm
+@@ -287,9 +287,10 @@ static void FBPStoryStartDownload(void) {
+     });
+ }
+ 
+-@interface FBPStoryDownloadTarget : NSObject
++@interface FBPStoryDownloadTarget : NSObject <UIGestureRecognizerDelegate>
+ + (instancetype)shared;
+ - (void)downloadTapped:(UIButton *)sender;
++- (void)threeFingerHold:(UILongPressGestureRecognizer *)gesture;
+ @end
+ 
+ @implementation FBPStoryDownloadTarget
+@@ -303,6 +304,17 @@ static void FBPStoryStartDownload(void) {
+     FBPStoryLog(@"button tapped currentVideoID=%@", gStoryVideoID);
+     FBPStoryStartDownload();
+ }
++- (void)threeFingerHold:(UILongPressGestureRecognizer *)gesture {
++    if (gesture.state != UIGestureRecognizerStateBegan) return;
++    UIImpactFeedbackGenerator *h =
++        [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleMedium];
++    [h impactOccurred];
++    FBPStoryStartDownload();
++}
++- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g
++    shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o {
++    return YES;
++}
+ @end
+ 
+ static void FBPStoryInstallOrUpdateButton(UIViewController *vc) {
+@@ -312,24 +324,19 @@ static void FBPStoryInstallOrUpdateButton(UIViewController *vc) {
+     UIView *host = vc.view;
+     if (!host) return;
+ 
+-    UIButton *button = (UIButton *)[host viewWithTag:kFBPStoryDownloadTag];
+-    if (![button isKindOfClass:UIButton.class]) {
+-        button = [UIButton buttonWithType:UIButtonTypeSystem];
+-        button.tag = kFBPStoryDownloadTag;
+-        button.tintColor = UIColor.whiteColor;
+-        button.backgroundColor = UIColor.clearColor;
+-        button.frame = CGRectMake(0, 0, 38, 38);
+-        button.accessibilityLabel = FBPL(@"download.story.a11y");
+-        [button setImage:[UIImage fbp_imageNamed:@"download"]
+-                forState:UIControlStateNormal];
+-        button.imageView.contentMode = UIViewContentModeScaleAspectFit;
+-        // Match the eye (mark-as-seen) button's glyph size in FBPStoryHooks.xm,
+-        // which in turn matches Facebook's own header controls.
+-        button.contentEdgeInsets = UIEdgeInsetsMake(8, 8, 8, 8);
+-        [button addTarget:[FBPStoryDownloadTarget shared]
+-                   action:@selector(downloadTapped:)
+-         forControlEvents:UIControlEventTouchUpInside];
+-        [host addSubview:button];
++    // 3-finger hold on the Story replaces the download button.
++    static const void *kHoldKey = &kHoldKey;
++    if (!objc_getAssociatedObject(host, kHoldKey)) {
++        UILongPressGestureRecognizer *g =
++            [[UILongPressGestureRecognizer alloc]
++                initWithTarget:[FBPStoryDownloadTarget shared]
++                        action:@selector(threeFingerHold:)];
++        g.numberOfTouchesRequired = 3;
++        g.minimumPressDuration = 0.6;
++        g.cancelsTouchesInView = NO;
++        g.delegate = [FBPStoryDownloadTarget shared];
++        [host addGestureRecognizer:g];
++        objc_setAssociatedObject(host, kHoldKey, g, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+     }
+ 
+     UIProgressView *progress = (UIProgressView *)[host viewWithTag:kFBPStoryProgressTag];
+@@ -349,17 +356,10 @@ static void FBPStoryInstallOrUpdateButton(UIViewController *vc) {
+     static const CGFloat kRowGap = 44.0;
+     CGFloat cx = CGRectGetWidth(host.bounds) - host.safeAreaInsets.right - kCloseCentreFromRight;
+     CGFloat cy = host.safeAreaInsets.top + kHeaderRowCentre + kRowGap * 2.0;
+-    button.center = CGPointMake(cx, cy);
+     progress.frame = CGRectMake(cx - 15.0, cy + 21.0, 30.0, 2.0);
+ 
+-    [host bringSubviewToFront:button];
+     [host bringSubviewToFront:progress];
+ 
+-    button.hidden = NO;
+-    button.enabled = !gStoryDownloading;
+-    button.alpha = button.enabled ? 1.0 : 0.45;
+-
+-    gStoryDownloadButton = button;
+     gStoryProgress = progress;
+ }
+ 
+diff --git a/src/Features/Stories/FBPStoryHooks.xm b/src/Features/Stories/FBPStoryHooks.xm
+index e834bff..d042ce0 100644
+--- a/src/Features/Stories/FBPStoryHooks.xm
++++ b/src/Features/Stories/FBPStoryHooks.xm
+@@ -324,6 +324,7 @@ static BOOL gStoryRowInstalled = NO;
+ static const void *kStoryButtonTargetKey = &kStoryButtonTargetKey;
+ 
+ static void FBPInstallStoryFallbackButton(UIViewController *controller) {
++    return; // eye button removed (mark-as-seen stays available in the story menu)
+     if (gStoryRowInstalled) return;
+     if (!FBPEnabled(FBPKeyAnonymousStories)) return;
+     if (!controller.isViewLoaded) return;
